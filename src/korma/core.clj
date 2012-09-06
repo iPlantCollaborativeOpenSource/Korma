@@ -4,7 +4,9 @@
             [korma.sql.fns :as sfns]
             [korma.sql.utils :as utils]
             [clojure.set :as set]
-            [korma.db :as db])
+            [clojure.string :as string]
+            [korma.db :as db]
+            [korma.config :as conf])
   (:use [korma.sql.engine :only [bind-query bind-params]]))
 
 (def ^{:dynamic true} *exec-mode* false)
@@ -98,7 +100,7 @@
         (where {:id 2}))"
   [ent & body]
   `(let [query# (-> (select* ~ent)
-                 ~@body)]
+                    ~@body)]
      (exec query#)))
 
 (defmacro update 
@@ -110,7 +112,7 @@
         (where {:id 4}))"
   [ent & body]
   `(let [query# (-> (update* ~ent)
-                  ~@body)]
+                    ~@body)]
      (exec query#)))
 
 (defmacro delete 
@@ -121,7 +123,7 @@
         (where {:id 7}))"
   [ent & body]
   `(let [query# (-> (delete* ~ent)
-                  ~@body)]
+                    ~@body)]
      (exec query#)))
 
 (defmacro insert 
@@ -133,7 +135,7 @@
         (values [{:name \"chris\"} {:name \"john\"}]))"
   [ent & body]
   `(let [query# (-> (insert* ~ent)
-                  ~@body)]
+                    ~@body)]
      (exec query#)))
 
 ;;*****************************************************
@@ -191,7 +193,7 @@
      (where* q# 
              (bind-query q#
                          (eng/pred-map
-                           ~(eng/parse-where `~form))))))
+                          ~(eng/parse-where `~form))))))
 
 (defn order
   "Add an ORDER BY clause to a select query. field should be a keyword of the field name, dir
@@ -214,6 +216,17 @@
 (defn join* [query type table clause]
   (update-in query [:joins] conj [type table clause]))
 
+(defn add-joins
+  "Adds join clauses to a query for a relationship.  If the relationship uses a
+   join table then two clauses will be added.  Otherwise, only one clause will
+   be added."
+  [query ent rel]
+  (if-let [join-table (:join-table rel)]
+    (-> query
+        (join* :left join-table (sfns/pred-= (:lpk rel) @(:lfk rel)))
+        (join* :left ent (sfns/pred-= @(:rfk rel) (:rpk rel))))
+    (join* query :left ent (sfns/pred-= (:pk rel) (:fk rel)))))
+
 (defmacro join 
   "Add a join clause to a select query, specifying the table name to join and the predicate
   to join on.
@@ -222,14 +235,14 @@
   (join query addresses (= :addres.users_id :users.id))
   (join query :right addresses (= :address.users_id :users.id))"
   ([query ent]
-   `(let [q# ~query
-          e# ~ent
-          rel# (get-rel (:ent q#) e#)]
-      (join* q# :left e# (sfns/pred-= (:pk rel#) (:fk rel#)))))
+     `(let [q# ~query
+            e# ~ent
+            rel# (get-rel (:ent q#) e#)]
+        (add-joins q# e# rel#)))
   ([query table clause]
-   `(join* ~query :left ~table (eng/pred-map ~(eng/parse-where clause))))
+     `(join* ~query :left ~table (eng/pred-map ~(eng/parse-where clause))))
   ([query type table clause]
-   `(join* ~query ~type ~table (eng/pred-map ~(eng/parse-where clause)))))
+     `(join* ~query ~type ~table (eng/pred-map ~(eng/parse-where clause)))))
 
 (defn post-query
   "Add a function representing a query that should be executed for each result in a select.
@@ -263,10 +276,10 @@
   [query agg alias & [group-by]]
   `(let [q# ~query]
      (bind-query q#
-               (let [res# (fields q# [~(eng/parse-aggregate agg) ~alias])]
-                 (if ~group-by
-                   (group res# ~group-by)
-                   res#)))))
+                 (let [res# (fields q# [~(eng/parse-aggregate agg) ~alias])]
+                   (if ~group-by
+                     (group res# ~group-by)
+                     res#)))))
 
 ;;*****************************************************
 ;; Other sql
@@ -368,6 +381,15 @@
         query))
     query))
 
+(defn- get-fkk
+  "Gets the foreign key keyword from a query."
+  [query]
+  (let [rel (-> query :ent :rel)]
+    (when-not (nil? rel)
+      (let [rel (force rel)]
+        (when-not (empty? rel)
+          (-> rel first val deref :fkk))))))
+
 (defn exec
   "Execute a query map and return the results."
   [query]
@@ -376,17 +398,19 @@
         sql (:sql-str query)
         params (:params query)]
     (cond
-      (:sql query) sql
-      (= *exec-mode* :sql) sql
-      (= *exec-mode* :query) query
-      (= *exec-mode* :dry-run) (do
-                                 (println "dry run ::" sql "::" (vec params))
-                                 (let [pk (-> query :ent :pk)
-                                       results (apply-posts query [{pk 1}])]
-                                   (first results)
-                                   results))
-      :else (let [results (db/do-query query)]
-              (apply-transforms query (apply-posts query results))))))
+     (:sql query) sql
+     (= *exec-mode* :sql) sql
+     (= *exec-mode* :query) query
+     (= *exec-mode* :dry-run) (do
+                                (println "dry run ::" sql "::" (vec params))
+                                (let [pk  (-> query :ent :pk)
+                                      fkk (get-fkk query)
+                                      res (if (nil? fkk) {pk 1} {pk 1 fkk 1})
+                                      results (apply-posts query [res])]
+                                  (first results)
+                                  results))
+     :else (let [results (db/do-query query)]
+             (apply-transforms query (apply-posts query results))))))
 
 (defn exec-raw
   "Execute a raw SQL string, supplying whether results should be returned. `sql` can either be
@@ -418,26 +442,52 @@
    :fields []
    :rel {}})
 
-(defn create-relation
-  "Create a relation map describing how two entities are related."
+(defn many-to-many-keys
+  "Determines and returns the keys needed for a many-to-many relationship."
+  [parent child {:keys [join-table lfk rfk]}]
+  {:lpk (raw (eng/prefix parent (:pk parent)))
+   :lfk (delay (raw (eng/prefix {:table (name join-table)} @lfk)))
+   :rfk (delay (raw (eng/prefix {:table (name join-table)} @rfk)))
+   :rpk (raw (eng/prefix child (:pk child)))
+   :join-table join-table})
+
+(defn get-belongs-to-keys
+  "Determines and returns the keys needed for belongs-to relationshiops."
+  [parent child]
+  (let [pkk (:pk parent)
+        fkk (keyword (str (:table parent) "_id"))]
+    {:pk  (raw (eng/prefix parent pkk))
+     :fk  (raw (eng/prefix child fkk))
+     :fkk fkk}))
+
+(defn get-db-keys
+  "Determines and returns the keys needed for has-one and has-many
+   relationshiops."
+  [parent child]
+  (let [pkk (:pk parent)
+        fkk (keyword (str (:table parent) "_id"))]
+    {:pk  (raw (eng/prefix parent pkk))
+     :fk  (raw (eng/prefix child fkk))}))
+
+(defn db-keys-and-foreign-ent
+  "Determines and returns the database keys and foreign entity for a
+   relationship."
+  [type ent sub-ent opts]
+  (condp = type
+    :many-to-many [(many-to-many-keys ent sub-ent opts) sub-ent]
+    :has-one      [(get-db-keys ent sub-ent) sub-ent]
+    :belongs-to   [(get-belongs-to-keys sub-ent ent) ent]
+    :has-many     [(get-db-keys ent sub-ent) sub-ent]))
+
+(defn create-rel
   [ent sub-ent type opts]
-  (let [[pk fk foreign-ent] (condp = type
-                  :has-one [(raw (eng/prefix ent (:pk ent)))
-                            (raw (eng/prefix sub-ent (keyword (str (:table ent) "_id"))))
-                            sub-ent]
-                  :belongs-to [(raw (eng/prefix sub-ent (:pk sub-ent)))
-                               (raw (eng/prefix ent (keyword (str (:table sub-ent) "_id"))))
-                               ent]
-                  :has-many [(raw (eng/prefix ent (:pk ent)))
-                             (raw (eng/prefix sub-ent (keyword (str (:table ent) "_id"))))
-                             sub-ent])
+  (let [[db-keys foreign-ent] (db-keys-and-foreign-ent type ent sub-ent opts)
         opts (when (:fk opts)
                {:fk (raw (eng/prefix foreign-ent (:fk opts)))})]
     (merge {:table (:table sub-ent)
             :alias (:alias sub-ent)
-            :rel-type type
-            :pk pk
-            :fk fk}
+            :rel-type type}
+           db-keys
            opts)))
 
 (defn rel
@@ -446,18 +496,24 @@
         cur-ns *ns*]
     (assoc-in ent [:rel (name var-name)]
               (delay
-                (let [resolved (ns-resolve cur-ns var-name)
-                      sub-ent (when resolved
-                                (deref sub-ent))]
-                  (when-not (map? sub-ent)
-                    (throw (Exception. (format "Entity used in relationship does not exist: %s" (name var-name)))))
-                  (create-relation ent sub-ent type opts))))))
+               (let [resolved (ns-resolve cur-ns var-name)
+                     sub-ent (when resolved (deref sub-ent))]
+                 (when-not (map? sub-ent)
+                   (throw (Exception. (format "Entity used in relationship does not exist: %s" (name var-name)))))
+                 (create-rel ent sub-ent type opts))))))
 
 (defn get-rel [ent sub-ent]
   (let [sub-name (if (map? sub-ent)
                    (:name sub-ent)
                    sub-ent)]
     (force (get-in ent [:rel sub-name]))))
+
+(defn default-fk-name
+  "Determines the default name to use for a foreign key."
+  [ent]
+  (if (string? ent)
+    (keyword (str ent "_id"))
+    (keyword (str (:table ent) "_id"))))
 
 (defmacro has-one
   "Add a has-one relationship for the given entity. It is assumed that the foreign key
@@ -485,6 +541,17 @@
   (has-many users email {:fk :emailID})"
   [ent sub-ent & [opts]]
   `(rel ~ent (var ~sub-ent) :has-many ~opts))
+
+(defmacro many-to-many
+  "Add a many-to-many relation for the given entity.  It is assumed that a join
+   table is used to implement the relationship and that the foreign keys are in
+   the join table."
+  [ent sub-ent join-table & [opts]]
+  `(rel ~ent (var ~sub-ent) :many-to-many
+                 (assoc ~opts
+                   :join-table ~join-table
+                   :lfk (delay (:lfk ~opts (default-fk-name ~ent)))
+                   :rfk (delay (:rfk ~opts (default-fk-name ~sub-ent))))))
 
 (defn entity-fields
   "Set the fields to be retrieved by default in select queries for the
@@ -532,7 +599,7 @@
   the body."
   [ent & body]
   `(let [e# (-> (create-entity ~(name ent))
-              ~@body)]
+                ~@body)]
      (def ~ent e#)))
 
 ;;*****************************************************
@@ -566,30 +633,127 @@
                  (update-in [:group] #(force-prefix sub-ent %)))]
     (merge-query query neue)))
 
-(defn- with-later [rel query ent func]
+(defn- with-many-to-many
+  "Defines the post-query to be used to obtain entities in a many-to-many
+   relationship with entities in the current query."
+  [rel query ent func opts]
+  (let [{:keys [lfk rfk rpk join-table]} rel
+        pk (get-in query [:ent :pk])
+        table (keyword (eng/table-alias ent))]
+    (post-query
+     query (partial
+            map
+            #(assoc % table
+                    (select ent
+                            (join :inner join-table (= @rfk rpk))
+                            (func)
+                            (where {@lfk (get % pk)})))))))
+
+(defn- with-later-fn
+  "Returns a function to be used to obtain entities in a relationship with
+   entities in the current query lazily.  This also allows the entities to be
+   retrieved as separate objects.  This function is used for has-many
+   relationships."
+  [table ent func known unknown]
+  (partial
+   map #(assoc % table
+               (select ent (func)
+                       (where {unknown (get % known)})))))
+
+(defn- with-one-later-fn
+  "Returns a function to be used to obtain entities in a relationship with
+   entities in the current query lazily.  This also allows the entities to be
+   retrieved as separate objects.  This function is used for has-one and
+   belongs-to relationships."
+  [table ent func known unknown]
+  (partial
+   map #(assoc % table
+               (first (select ent (func)
+                              (where {unknown (get % known)}))))))
+
+(defn- with-later
+  "Defines the post-query to be used to obtain entities in a has-many
+   relationship with entities in the current query lazily.  This also allows
+   the entities to be retrieved as separate objects."
+  [rel query ent func opts]
   (let [fk (:fk rel)
         pk (get-in query [:ent :pk])
         table (keyword (eng/table-alias ent))]
-    (post-query query 
-                (partial map 
-                         #(assoc % table
-                                 (select ent
-                                         (func)
-                                         (where {fk (get % pk)})))))))
+    (post-query query (with-later-fn table ent func pk fk))))
 
-(defn- with-now [rel query ent func]
+(defn- with-one-later
+  "Defines the post-query to be used to obtain entities in has-one or
+   belongs-to relationships with entities in the current query lazily.  This
+   also allows the entities to be retrieved as separate objects."
+  [rel query ent func opts]
+  (let [fk (:fk rel)
+        pk (get-in query [:ent :pk])
+        table (keyword (eng/table-alias ent))]
+    (post-query query (with-one-later-fn table ent func pk fk))))
+
+(defn- with-now
+  "Defines the join to be used to obtain entries in has-one or belongs-to
+   relationships with entities in the current query eagerly.  In this case,
+   columns in the joined tables are included in the primary entity object."
+  [rel query ent func opts]
   (let [table (if (:alias rel)
                 [(:table ent) (:alias ent)]
                 (:table ent))
         query (join query table (= (:pk rel) (:fk rel)))]
     (sub-query query ent func)))
 
-(defn with* [query sub-ent func]
-  (let [rel (get-rel (:ent query) sub-ent)]
-    (cond
-      (not rel) (throw (Exception. (str "No relationship defined for table: " (:table sub-ent))))
-      (#{:has-one :belongs-to} (:rel-type rel)) (with-now rel query sub-ent func)
-      :else (with-later rel query sub-ent func))))
+(defn- with-has-one
+  "Defines the post-query or join to be used to obtain entities in a has-one
+   relationship with entities in the current query.  If the :later option is
+   enabled then the entities will be retrieved lazily and will be returned as
+   separate objects.  Otherwise, the entities will be retrieved eagerly and the
+   columns in the entities will be included in the objects associated with the
+   entities in the query."
+  [rel query ent func opts]
+  (if (:later opts)
+    (with-one-later rel query ent func opts)
+    (with-now rel query ent func opts)))
+
+(defn- with-belongs-to-later
+  "Defines the post-query to be used to obtain entities in a belongs-to
+   relationship with entities in the current query.  This also allowd the
+   entities to be retrieved as separate objects."
+  [rel query ent func opts]
+  (let [fkk (:fkk rel)
+        pk  (:pk rel)
+        table (keyword (eng/table-alias ent))]
+    (post-query query (with-one-later-fn table ent func fkk pk))))
+
+(defn- with-belongs-to
+  "Defines the post-query or join to be used to obtain entities in a belongs-to
+   relationship with entities in the current query.  If the :later option is
+   enabled then the entities will be retrieved lazily and will be returned as
+   separate objects.  Otherwise, the entities will be retrieved eagerly and the
+   columns in the entities will be included in the objects associated with the
+   entities in the query."
+  [rel query ent func opts]
+  (if (:later opts)
+    (with-belongs-to-later rel query ent func opts)
+    (with-now rel query ent func opts)))
+
+(def ^:private with-handlers
+  {:has-many with-later
+   :many-to-many with-many-to-many
+   :has-one with-has-one
+   :belongs-to with-belongs-to})
+
+(defn with*
+  "Allows related entities to be fetched along with the query results.  This
+   function is identical to korma.core/with* except that it also supports
+   many-to-many relationships and lazy loading of objects in has-one and
+   belongs-to relationships."
+  [query sub-ent func opts]
+  (let [rel (get-rel (:ent query) sub-ent)
+        handler-fn (get with-handlers (:rel-type rel))]
+    (when (nil? handler-fn)
+      (throw (IllegalArgumentException.
+              (str "unknown relationship type: " (:rel-type rel)))))
+    (handler-fn rel query sub-ent func opts)))
 
 (defmacro with
   "Add a related entity to the given select query. If the entity has a relationship
@@ -611,4 +775,13 @@
   [query ent & body]
   `(with* ~query ~ent (fn [q#]
                         (-> q#
-                            ~@body))))
+                            ~@body)) {}))
+
+(defmacro with-object
+  "Allows related entities to be fetched along with the query results.  This
+   macro is identical to korma.core/with except that it also supports lazy
+   loading of entities in has-one and belongs-to relationships."
+  [query ent & body]
+  `(with* ~query ~ent (fn [q#]
+                        (-> q#
+                            ~@body)) {:later true}))
